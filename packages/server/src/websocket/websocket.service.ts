@@ -107,9 +107,10 @@ export class WebsocketService {
       this.logger.debug(
         `[takeFromQueue] Fetched ${mongoMappedMessages.length} messages from MongoDB for connectionId ${connectionId}`,
       )
-
       // Combine messages from Redis and MongoDB
       const combinedMessages: QueuedMessage[] = [...redisMessages, ...mongoMappedMessages]
+
+      this.logger.debug(`[takeFromQueue] combinedMessages for connectionId ${connectionId}: ${combinedMessages}`)
 
       return combinedMessages
     } catch (error) {
@@ -135,7 +136,11 @@ export class WebsocketService {
 
     try {
       // retrieve the list count of messages for the connection
-      const messageCount = await this.redis.llen(`connectionId:${connectionId}:queuemessages`)
+      const redisMessageCount = await this.redis.llen(`connectionId:${connectionId}:queuemessages`)
+
+      const mongoMessageCount = await this.queuedMessage.countDocuments({ connectionId })
+
+      const messageCount = redisMessageCount + mongoMessageCount
 
       this.logger.debug(`[getAvailableMessageCount] Message count retrieved for connectionId ${connectionId}`, {
         messageCount,
@@ -186,11 +191,13 @@ export class WebsocketService {
       await this.redis.rpush(`connectionId:${connectionId}:queuemessages`, JSON.stringify(messageData))
 
       // test send message to publish channel connection id
-      const messagePublish = {
-        id: messageId,
-        receivedAt,
-        encryptedMessage: payload,
-      }
+      const messagePublish: QueuedMessage[] = [
+        {
+          id: messageId,
+          receivedAt,
+          encryptedMessage: payload,
+        },
+      ]
 
       this.logger.debug(`[addMessage] Message stored in Redis for connectionId ${connectionId}`)
 
@@ -253,7 +260,7 @@ export class WebsocketService {
       // Remove messages from MongoDB
       const response = await this.queuedMessage.deleteMany({
         connectionId: connectionId,
-        _id: { $in: messageIds.map((id) => new Object(id)) },
+        messageId: { $in: messageIds.map((id) => new Object(id)) },
       })
 
       this.logger.debug('[removeMessages] Messages removed from MongoDB', {
@@ -391,7 +398,7 @@ export class WebsocketService {
         })
 
         // Handles messages received on the subscribed Redis channel
-        this.redisSubscriber.on('message', (channel: string, message: QueuedMessage[]) => {
+        this.redisSubscriber.on('message', (channel: string, message: string) => {
           if (channel === connectionId) {
             this.logger.log(`*** [redisSubscriber] Received message from ${channel}: ${message} **`)
 
@@ -400,7 +407,7 @@ export class WebsocketService {
               method: 'messageReceive',
               params: {
                 connectionId,
-                message,
+                message: JSON.parse(message),
                 id: dto.id,
               },
             }
