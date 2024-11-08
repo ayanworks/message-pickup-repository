@@ -143,6 +143,7 @@ export class MessagePersister implements OnModuleDestroy {
               connectionId: message.connectionId,
               recipientKeys: message.recipientDids,
               encryptedMessage: message.encryptedMessage,
+              encryptedMessageSize: message.encryptedMessageSize,
               state: message.state,
               createdAt: new Date(message.receivedAt),
             })
