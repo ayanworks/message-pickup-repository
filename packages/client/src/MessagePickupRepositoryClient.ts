@@ -6,6 +6,8 @@ import {
   AddLiveSessionOptions,
   MessagesReceivedCallbackParams,
   ExtendedTakeFromQueueOptions,
+  ExtendedAddMessageOptions,
+  ConnectionInfo,
 } from './interfaces'
 import {
   AddMessageOptions,
@@ -21,12 +23,11 @@ export class MessagePickupRepositoryClient implements MessagePickupRepository {
   private client?: Client
   private readonly logger = log
   private messagesReceivedCallback: ((data: MessagesReceivedCallbackParams) => void) | null = null
+  private connectionInfoCallback?: (connectionId: string) => Promise<ConnectionInfo | undefined>
   private readonly url: string
-  private readonly maxReceiveBytes?: number
 
-  constructor(options: { url: string; maxReceiveBytes?: number }) {
+  constructor(options: { url: string }) {
     this.url = options.url
-    this.maxReceiveBytes = options.maxReceiveBytes
   }
 
   /**
@@ -62,6 +63,14 @@ export class MessagePickupRepositoryClient implements MessagePickupRepository {
     })
   }
 
+  /**
+   * Checks if the WebSocket client is initialized and returns it.
+   * If the client is not initialized, throws an error instructing to call `connect()` first.
+   *
+   * @private
+   * @throws {Error} Will throw an error if the client is not initialized.
+   * @returns {Client} The initialized WebSocket client instance.
+   */
   private checkClient(): Client {
     if (!this.client) {
       throw new Error('Client is not initialized. Call connect() first.')
@@ -95,6 +104,32 @@ export class MessagePickupRepositoryClient implements MessagePickupRepository {
   }
 
   /**
+   * Sets the callback function to retrieve connection-specific information.
+   * This callback provides the `ConnectionInfo` object, containing details like
+   * the FCM notification token and max receive bytes, based on the given `connectionId`.
+   *
+   * @param {function} callback - A function that takes a `connectionId` as a parameter and returns
+   * a `Promise` that resolves to a `ConnectionInfo` object or `undefined` if no information is available.
+   *
+   * @example
+   * // Example of setting the callback to retrieve connection-specific information
+   * const client = new MessagePickupRepositoryClient({ url: 'wss://example.com' });
+   *
+   * const getConnectionInfo = async (connectionId: string) => {
+   *   const connectionRecord = await agent.connections.findById(connectionId);
+   *   return {
+   *     fcmNotificationToken: connectionRecord?.getTag('device_token') as string | undefined,
+   *     maxReceiveBytes: config.messagePickupMaxReceiveBytes,
+   *   };
+   * };
+   *
+   * client.setConnectionInfo(getConnectionInfo);
+   */
+  setConnectionInfo(callback: (connectionId: string) => Promise<ConnectionInfo | undefined>): void {
+    this.connectionInfoCallback = callback
+  }
+
+  /**
    * Calls the 'takeFromQueue' RPC method on the WebSocket server.
    * This method sends a request to retrieve messages from the queue for the specified connection.
    * It can retrieve messages up to a specified byte limit (`limitBytes`) or by a count limit (`limit`).
@@ -116,9 +151,15 @@ export class MessagePickupRepositoryClient implements MessagePickupRepository {
     try {
       const client = this.checkClient()
 
+      const connectionInfo = this.connectionInfoCallback
+        ? await this.connectionInfoCallback(params.connectionId)
+        : undefined
+
+      const maxReceiveBytes = connectionInfo?.maxReceiveBytes
+
       // Add limitBytes to params if maxReceiveBytes is set
-      if (this.maxReceiveBytes) {
-        params = { ...params, limitBytes: this.maxReceiveBytes }
+      if (maxReceiveBytes) {
+        params = { ...params, limitBytes: maxReceiveBytes }
       }
 
       // Call the RPC method and store the result as 'unknown' type initially
@@ -164,33 +205,43 @@ export class MessagePickupRepositoryClient implements MessagePickupRepository {
   }
 
   /**
-   * Call the 'addMessage' RPC method.
-   * This method sends a request to the WebSocket server to add a message to the queue.
-   * It expects the response to be a string or null.
+   * Calls the 'addMessage' RPC method.
+   * This function sends a request to the WebSocket server to add a message to the queue.
+   * It retrieves the device token (if available) and includes it in the parameters.
+   * Expects the response from the server to be a JSON string or an empty string if null.
    *
-   * @param {AddMessageOptions} params - The parameters to pass to the 'addMessage' method, including:
+   * @param {ExtendedAddMessageOptions} params - Parameters for the 'addMessage' method, including:
    *   @property {string} connectionId - The ID of the connection to which the message will be added.
-   *   @property {string[]} recipientDids - An array of DIDs of the recipients for whom the message is intended.
+   *   @property {string[]} recipientDids - Array of DIDs for the intended recipients of the message.
    *   @property {EncryptedMessage} payload - The encrypted message content to be queued.
-   * @returns {Promise<string|null>} - The result from the WebSocket server, expected to be a string or null.
-   * @throws Will throw an error if the result is not an object, null, or if there's any issue with the WebSocket call.
+   *   @property {string} [token] - (Optional) A token associated with the device; will be populated if available.
+   * @returns {Promise<string>} - The server response, expected as a JSON string or an empty string if the response is null.
+   * @throws {Error} Will throw an error if the result is neither an object nor null, or if any issue occurs during the WebSocket call.
    */
-  async addMessage(params: AddMessageOptions): Promise<string> {
+  async addMessage(params: ExtendedAddMessageOptions): Promise<string> {
     try {
       const client = this.checkClient()
-      // Call the RPC method and store the result as 'unknown' type initially
+
+      // Retrieve connection information using the callback, if set
+      const connectionInfo = this.connectionInfoCallback
+        ? await this.connectionInfoCallback(params.connectionId)
+        : undefined
+
+      // Set the token and max bytes from the connection info, if available
+      params.token = connectionInfo?.fcmNotificationToken
+
+      // Call the 'addMessage' RPC method on the WebSocket server
       const result: unknown = await client.call('addMessage', params, 2000)
 
+      // Log the result and handle the response format
       this.logger.debug(`**** result: ${JSON.stringify(result, null, 2)} ***`)
 
-      // Check if the result is a string and cast it
-      if (result && typeof result === 'object') {
-        return JSON.stringify(result)
-      } else if (result === null) {
-        return ''
-      } else {
-        throw new Error('Unexpected result: Expected an object or null')
-      }
+      // Return JSON stringified result if it's an object, or an empty string if result is null
+      if (result === null) return ''
+      if (typeof result === 'object') return JSON.stringify(result)
+
+      // If result is neither an object nor null, throw an error
+      throw new Error('Unexpected result: Expected an object or null')
     } catch (error) {
       // Log the error and rethrow it for further handling
       this.logger.error('Error calling addMessage:', error)
