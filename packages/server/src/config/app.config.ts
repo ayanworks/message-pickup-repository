@@ -62,6 +62,13 @@ export default registerAs('appConfig', () => ({
   redisDbUrl: process.env.REDIS_URL || 'redis://localhost:6379',
 
   /**
+   * The SQLLite URI for connecting to the database.
+   * Defaults to a local path instance if SQLLITE_URI is not set in the environment variables.
+   * @type {string}
+   */
+  sqlLiteDbUri: process.env.SQLLITE_URI || 'data.sqlite',
+
+  /**
    *Allows set threshold time to execute messagePersist module on milisecond
    */
   thresholdTimestamp: parseInt(process.env.THRESHOLD_TIMESTAMP) || 60000,

@@ -1,74 +1,29 @@
-import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose'
-import { Document, HydratedDocument } from 'mongoose'
-import { EncryptedMessage } from '../dto/messagerepository-websocket.dto'
+import { Entity, Column, PrimaryGeneratedColumn } from 'typeorm';
 
-/**
- * Represents a message queued for delivery, stored in the database.
- *
- * @typedef {HydratedDocument<StoreQueuedMessage>} StoreQueuedMessageDocument - The Mongoose document type for a queued message.
- */
-export type StoreQueuedMessageDocument = HydratedDocument<StoreQueuedMessage>
+@Entity('store_queued_message')
+export class StoreQueuedMessage {
+  @PrimaryGeneratedColumn('uuid')
+  id: string; // Auto-generated UUID as the primary key
 
-@Schema({ timestamps: true })
-export class StoreQueuedMessage extends Document {
-  /**
-   * The unique identifier of the message add with the queued message.
-   * @type {string}
-   */
-  @Prop({ required: true, index: 1 })
-  messageId: string
-  /**
-   * The unique identifier of the connection associated with the queued message.
-   * @type {string}
-   */
-  @Prop({ required: true, index: 1 })
-  connectionId: string
+  @Column({ type: 'varchar', nullable: false })
+  messageId: string;
 
-  /**
-   * The encrypted message payload that is queued for delivery.
-   * @type {EncryptedMessage}
-   */
-  @Prop({ type: Object, required: true })
-  encryptedMessage: EncryptedMessage
+  @Column({ type: 'varchar', nullable: true })
+  connectionId: string;
 
-  /**
-   * The size Encrypted Message store in collection
-   * @type {number}
-   */
-  @Prop()
-  encryptedMessageByteCount?: number
+  // Store array as JSON string for SQLite compatibility
+  @Column({ type: 'text', nullable: true })
+  recipientKeys: string; // Serialized JSON string of keys
 
-  /**
-   * The recipient keys (DIDs or other identifiers) associated with the message.
-   * @type {string[]}
-   */
-  @Prop({ required: true })
-  recipientKeys: string[]
+  @Column({ type: 'text', nullable: false })
+  encryptedMessage: string; // Serialized JSON string of encrypted message
 
-  /**
-   * The current state of the message (e.g., 'pending', 'sending').
-   * @type {string}
-   */
-  @Prop()
-  state?: string
+  @Column({ type: 'int', nullable: true })
+  encryptedMessageByteCount: number;
 
-  /**
-   * The timestamp when the message was created.
-   * Mongoose automatically creates this field when `timestamps: true` is set in the schema.
-   * @type {Date}
-   */
-  createdAt?: Date
+  @Column({ type: 'varchar', nullable: false })
+  state: string;
 
-  /**
-   * The timestamp when the message was last updated.
-   * Mongoose automatically creates this field when `timestamps: true` is set in the schema.
-   * @type {Date}
-   */
-  updatedAt?: Date
+  @Column({ type: 'datetime', nullable: false })
+  createdAt: Date;
 }
-
-/**
- * The schema definition for the QueuedMessage model.
- * Includes timestamps for creation and update times.
- */
-export const StoreQueuedMessageSchema = SchemaFactory.createForClass(StoreQueuedMessage)

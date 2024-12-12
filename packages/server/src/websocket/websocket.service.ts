@@ -1,8 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common'
 import { InjectModel } from '@nestjs/mongoose'
 import { ConfigService } from '@nestjs/config'
-import { Model } from 'mongoose'
-import { ObjectId } from 'mongodb'
+// import { Model } from 'mongoose'
+// import { ObjectId } from 'mongodb'
+import { InjectRepository } from '@nestjs/typeorm';
+import { In, Like, Raw, Repository } from 'typeorm';
 import { MessageState } from '../config/constants'
 import {
   AddMessageDto,
@@ -20,16 +22,17 @@ import { QueuedMessage } from '@credo-ts/core'
 import { Server } from 'rpc-websockets'
 import Redis from 'ioredis'
 import { JsonRpcResponseSubscriber } from './interfaces/interfaces'
+import { uuid } from '@credo-ts/core/build/utils/uuid';
 
 @Injectable()
 export class WebsocketService {
   private readonly logger: Logger
   private readonly redisSubscriber: Redis
   private readonly redisPublisher: Redis
-  private server: Server
-
+  private server: Server;
   constructor(
-    @InjectModel(StoreQueuedMessage.name) private queuedMessage: Model<StoreQueuedMessage>,
+    @InjectRepository(StoreQueuedMessage)
+    private readonly storeQueuedMessageRepository: Repository<StoreQueuedMessage>,
     @InjectRedis() private readonly redis: Redis,
     private configService: ConfigService,
     private readonly httpService: HttpService,
@@ -98,8 +101,10 @@ export class WebsocketService {
     try {
       // retrieve the list count of messages for the connection
       const redisMessageCount = await this.redis.llen(`connectionId:${connectionId}:queuemessages`)
-
-      const mongoMessageCount = await this.queuedMessage.countDocuments({ connectionId })
+      
+      const mongoMessageCount = await this.storeQueuedMessageRepository.count({
+        where: { connectionId },
+      })
 
       const messageCount = redisMessageCount + mongoMessageCount
 
@@ -135,7 +140,7 @@ export class WebsocketService {
 
     try {
       // Generate a unique ID for the message
-      messageId = new ObjectId().toString()
+      messageId = uuid()
       receivedAt = new Date()
 
       // Calculate the size in bytes of the encrypted message to add database
@@ -168,7 +173,7 @@ export class WebsocketService {
 
       this.logger.debug(`[addMessage] Message stored in Redis for connectionId ${connectionId}`)
 
-      await this.redisPublisher.publish(connectionId, JSON.stringify(messagePublish))
+      await this.redisPublisher.publish(connectionId, JSON.stringify(messagePublish))      
 
       if (!(await this.getLiveSession(dto))) {
         // If not in a live session
@@ -225,15 +230,16 @@ export class WebsocketService {
       }
 
       // Remove messages from MongoDB
-      const response = await this.queuedMessage.deleteMany({
+
+      const response = await this.storeQueuedMessageRepository.delete({
         connectionId: connectionId,
-        messageId: { $in: messageIds.map((id) => new Object(id)) },
-      })
+        id: In(messageIds), // `In` operator replaces `$in`
+      });
 
       this.logger.debug('[removeMessages] Messages removed from MongoDB', {
         connectionId,
         messageIds,
-        deletedCount: response.deletedCount,
+        deletedCount: response.affected,
       })
     } catch (error) {
       // Log the error
@@ -274,11 +280,16 @@ export class WebsocketService {
         await this.redis.lrem(key, 1, message) // Remove each message from the list in Redis
       }
 
-      // Remove the corresponding messages from MongoDB
-      await this.queuedMessage.deleteMany({
+      // // Remove the corresponding messages from MongoDB
+      // await this.storeQueuedMessageRepository.delete(where{
+      //   connectionId,
+      //   recipientKeys: recipientDid, // Assuming recipientDids is stored as an array in MongoDB
+      // })
+
+      const response = await this.storeQueuedMessageRepository.delete({
         connectionId,
-        recipientKeys: recipientDid, // Assuming recipientDids is stored as an array in MongoDB
-      })
+        recipientKeys: Raw((alias) => `${alias} LIKE :recipientDid`, { recipientDid: `%${recipientDid}%` }),
+      });
 
       this.logger.log(
         `Successfully removed all messages for connectionId ${connectionId} and recipientDid ${recipientDid}`,
@@ -368,7 +379,7 @@ export class WebsocketService {
 
         if (isSubscribed) {
           // If already subscribed, unsubscribe first using the subscriber Redis connection
-          this.logger.log(`[addLiveSession] Already subscribed to ${connectionId}, unsubscribing first...`)
+          this.logger.log(`[addLiveSession] Already subscribed to ${connectionId}, unsubscribing first...`)          
           await this.redisSubscriber.unsubscribe(connectionId, (err, count) => {
             if (err) this.logger.error(err.message)
             this.logger.log(`Unsubscribed ${count} from ${connectionId} channel.`)
@@ -501,7 +512,7 @@ export class WebsocketService {
    */
   async checkPendingMessagesInQueue(dto: ConnectionIdDto): Promise<number> {
     // Ensures the queuedMessage model is initialized before proceeding
-    if (!this.queuedMessage) {
+    if (!this.storeQueuedMessageRepository) {
       this.logger.error('[checkPendingMessagesInQueue] queuedMessage model is not initialized')
       throw new Error('[checkPendingMessagesInQueue] queuedMessage model is not initialized')
     }
@@ -512,26 +523,44 @@ export class WebsocketService {
 
     try {
       // Finds messages in the "sending" state for the specified connection ID
-      const messagesToSend = await this.queuedMessage.find({
-        state: MessageState.sending,
-        connectionId,
-      })
+      // const messagesToSend = await this.storeQueuedMessageRepository.find({
+      //   state: MessageState.sending,
+      //   connectionId,
+      //})
+
+      const messagesToSend = await this.storeQueuedMessageRepository.find({
+        where: {
+          state: MessageState.sending,
+         connectionId,
+        },
+      });
 
       if (messagesToSend.length > 0) {
-        const messageIds = messagesToSend.map((message) => message._id)
+        const messageIds = messagesToSend.map((message) => message.id)
 
         // Updates the state of these messages to "pending"
-        const response = await this.queuedMessage.updateMany(
-          { _id: { $in: messageIds } },
-          { $set: { state: MessageState.pending } },
-        )
+        // const response = await this.queuedMessage.updateMany(
+        //   { _id: { $in: messageIds } },
+        //   { $set: { state: MessageState.pending } },
+        // )
+
+        const messagesToUpdate = await this.storeQueuedMessageRepository.findBy({          
+          id: In(messageIds), // `In` operator replaces `$in`
+        });
+
+        if (messagesToUpdate.length > 0) {
+          for (const message of messagesToUpdate) {
+            message.state = MessageState.pending;
+          }
+          await this.storeQueuedMessageRepository.save(messagesToUpdate);
+        }
 
         this.logger.debug('[checkPendingMessagesInQueue] Messages updated to "pending"', {
           connectionId,
-          updatedCount: response.modifiedCount,
+          updatedCount: messagesToUpdate.length,
         })
 
-        return response.modifiedCount
+        return messagesToUpdate.length 
       } else {
         // Logs that no messages were found in the "sending" state
         this.logger.debug('[checkPendingMessagesInQueue] No messages in "sending" state')
@@ -691,22 +720,52 @@ export class WebsocketService {
 
     try {
       // Query MongoDB with the provided connectionId or recipientDid, and state 'pending'
-      const mongoMessages = await this.queuedMessage
-        .find({
-          $or: [{ connectionId }, { recipientKeys: recipientDid }],
-          state: 'pending',
-        })
-        .sort({ createdAt: 1 })
-        .limit(limit)
-        .select({ messageId: 1, encryptedMessage: 1, createdAt: 1 })
-        .lean()
-        .exec()
+      // const mongoMessages = await this.queuedMessage
+      //   .find({
+      //     $or: [{ connectionId }, { recipientKeys: recipientDid }],
+      //     state: 'pending',
+      //   })
+      //   .sort({ createdAt: 1 })
+      //   .limit(limit)
+      //   .select({ messageId: 1, encryptedMessage: 1, createdAt: 1 })
+      //   .lean()
+      //   .exec()
 
-      const mongoMappedMessages: QueuedMessage[] = mongoMessages.map((msg) => ({
-        id: msg.messageId,
-        receivedAt: msg.createdAt,
-        encryptedMessage: msg.encryptedMessage,
-      }))
+        // const messages = await this.storeQueuedMessageRepository.find({
+        //   where: [
+        //     { connectionId, state: 'pending' },
+        //     { recipientKeys: Like(`%${recipientDid}%`), state: 'pending' },
+        //   ],
+        //   order: { createdAt: 'ASC' },
+        //   take: limit,
+        //   select: ['id', 'createdAt', 'encryptedMessage'],
+        // });
+        
+        const messages = await this.storeQueuedMessageRepository.find({
+          where: [
+            { connectionId, state: 'pending' },
+            {
+              state: 'pending',
+              recipientKeys: Raw((alias) => `${alias} LIKE :recipientDid`, { recipientDid: `%${recipientDid}%` }),
+            },
+          ],
+          order: { createdAt: 'ASC' },
+          take: limit,
+          select: ['id', 'createdAt', 'encryptedMessage'],
+        });
+
+        const mongoMappedMessages: QueuedMessage[] = messages.map((msg) => ({
+          id: msg.id.toString(),
+          receivedAt: msg.createdAt,
+          encryptedMessage: JSON.parse(msg.encryptedMessage),
+        }));
+
+      // const mongoMappedMessages: QueuedMessage[] = mongoMessages.map((msg) => ({
+      //   id: msg.messageId,
+      //   receivedAt: msg.createdAt,
+      //   encryptedMessage: msg.encryptedMessage,
+      // }))
+
 
       this.logger.debug(
         `[takeMessagesWithLimit] Fetched ${mongoMappedMessages.length} messages from MongoDB for connectionId ${connectionId}`,
@@ -759,17 +818,30 @@ export class WebsocketService {
 
     try {
       // Step 1: Retrieve messages from MongoDB with size limit
-      const mongoMessages = await this.queuedMessage
-        .find({
-          $or: [{ connectionId }, { recipientKeys: recipientDid }],
-          state: 'pending',
-        })
-        .sort({ createdAt: 1 })
-        .select({ messageId: 1, encryptedMessage: 1, createdAt: 1, encryptedMessageByteCount: 1 })
-        .lean()
-        .exec()
+      // const mongoMessages = await this.queuedMessage
+      //   .find({
+      //     $or: [{ connectionId }, { recipientKeys: recipientDid }],
+      //     state: 'pending',
+      //   })
+      //   .sort({ createdAt: 1 })
+      //   .select({ messageId: 1, encryptedMessage: 1, createdAt: 1, encryptedMessageByteCount: 1 })
+      //   .lean()
+      //   .exec()
 
-      for (const msg of mongoMessages) {
+        const sqliteMessages = await this.storeQueuedMessageRepository.find({
+          where: [
+            { connectionId, state: 'pending' },
+            {
+              state: 'pending',
+              recipientKeys: Raw((alias) => `${alias} LIKE :recipientDid`, { recipientDid: `%${recipientDid}%` }),
+            },
+          ],
+          order: { createdAt: 'ASC' },
+          take: 100, // Adjust limit as needed
+          select: ['id', 'createdAt', 'encryptedMessage', 'encryptedMessageByteCount'],
+        });
+
+      for (const msg of sqliteMessages) {
         const messageSize =
           msg.encryptedMessageByteCount || Buffer.byteLength(JSON.stringify(msg.encryptedMessage), 'utf8')
 
@@ -778,7 +850,7 @@ export class WebsocketService {
         combinedMessages.push({
           id: msg.messageId,
           receivedAt: msg.createdAt,
-          encryptedMessage: msg.encryptedMessage,
+          encryptedMessage: JSON.parse(msg.encryptedMessage),
         })
         currentSize += messageSize
       }

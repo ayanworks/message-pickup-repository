@@ -1,7 +1,9 @@
 import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common'
 import { InjectModel } from '@nestjs/mongoose'
 import { StoreQueuedMessage } from '../schemas/StoreQueuedMessage'
-import { Model } from 'mongoose'
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
+//import { Model } from 'mongoose'
 import Redis from 'ioredis'
 import { InjectRedis } from '@nestjs-modules/ioredis'
 import { ConfigService } from '@nestjs/config'
@@ -17,12 +19,21 @@ export class MessagePersister implements OnModuleDestroy {
   private checkInterval: NodeJS.Timeout | null = null
   private readonly instanceId = os.hostname() // Unique ID for this instance
 
+  // constructor(
+  //   @InjectModel(StoreQueuedMessage.name) private storeQueuedMessage: Model<StoreQueuedMessage>,
+  //   @InjectRedis() private readonly redis: Redis,
+  //   private readonly configService: ConfigService,
+  // ) {
+  //   this.initiateMasterRole()
+  // }
+
   constructor(
-    @InjectModel(StoreQueuedMessage.name) private storeQueuedMessage: Model<StoreQueuedMessage>,
+    @InjectRepository(StoreQueuedMessage)
+    private readonly storeQueuedMessageRepository: Repository<StoreQueuedMessage>,    
     @InjectRedis() private readonly redis: Redis,
     private readonly configService: ConfigService,
   ) {
-    this.initiateMasterRole()
+    this.initiateMasterRole();
   }
 
   // Attempts to acquire the mastership role and start the monitoring process if successful
@@ -138,15 +149,24 @@ export class MessagePersister implements OnModuleDestroy {
         if (receivedAtTimestamp < threshold) {
           this.logger.log(`[persistMessages] Message is older than threshold, migrating...`)
           try {
-            await this.storeQueuedMessage.create({
+            // await this.prisma.storeQueuedMessage.create({ data:{
+            //   messageId: message.messageId,
+            //   connectionId: message.connectionId,
+            //   recipientKeys: message.recipientDids,
+            //   encryptedMessage: message.encryptedMessage,
+            //   encryptedMessageSize: message.encryptedMessageSize,
+            //   state: message.state,
+            //   createdAt: new Date(message.receivedAt),
+            // }})
+            await this.storeQueuedMessageRepository.save({
               messageId: message.messageId,
               connectionId: message.connectionId,
-              recipientKeys: message.recipientDids,
-              encryptedMessage: message.encryptedMessage,
-              encryptedMessageSize: message.encryptedMessageSize,
+              recipientKeys: JSON.stringify(message.recipientDids), // Convert array to JSON string
+              encryptedMessage: JSON.stringify(message.encryptedMessage), // Convert object to JSON string
+              encryptedMessageByteCount: message.encryptedMessageSize,
               state: message.state,
               createdAt: new Date(message.receivedAt),
-            })
+            });
             await this.redis.lrem(fullKey, 1, messageData)
             this.logger.log(
               `[persistMessages] Migrated and deleted message with key: ${fullKey} and messageId: ${message.messageId}`,

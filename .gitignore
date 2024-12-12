@@ -41,3 +41,5 @@ lerna-debug.log*
 #files
 package-lock.json
 packages/server/yarn.lock
+packages/server/.env
+yarn.lock

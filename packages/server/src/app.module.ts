@@ -4,6 +4,9 @@ import { WebsocketModule } from './websocket/websocket.module'
 import { HandledRedisModule } from './modules/redis.module'
 import { HandledMongooseModule } from './modules/mongo.module'
 import appConfig from './config/app.config'
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { StoreQueuedMessage } from './websocket/schemas/StoreQueuedMessage'
+import { HandledSqlLiteModule } from './modules/sqlLite.module'
 
 @Module({
   imports: [
@@ -13,10 +16,16 @@ import appConfig from './config/app.config'
       load: [appConfig],
       isGlobal: true,
     }),
-    HandledMongooseModule,
+    //HandledMongooseModule,
+    HandledSqlLiteModule,
+    TypeOrmModule.forFeature([StoreQueuedMessage]),
     HandledRedisModule,
   ],
   controllers: [],
-  providers: [HandledMongooseModule, HandledRedisModule],
+  providers: [
+    //HandledMongooseModule, 
+    HandledSqlLiteModule,
+    HandledRedisModule, 
+  ],
 })
 export class AppModule {}
