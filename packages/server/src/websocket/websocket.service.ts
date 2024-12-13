@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common'
+import { Inject, Injectable, Logger } from '@nestjs/common'
 import { InjectModel } from '@nestjs/mongoose'
 import { ConfigService } from '@nestjs/config'
 // import { Model } from 'mongoose'
@@ -23,32 +23,69 @@ import { Server } from 'rpc-websockets'
 import Redis from 'ioredis'
 import { JsonRpcResponseSubscriber } from './interfaces/interfaces'
 import { uuid } from '@credo-ts/core/build/utils/uuid';
+import { connect, NatsConnection, StringCodec, Subscription, JetStreamManager, JetStreamClient, JSONCodec } from 'nats';
+import { ClientNats, ClientProxy } from '@nestjs/microservices';
+import { promises } from 'dns';
 
 @Injectable()
 export class WebsocketService {
   private readonly logger: Logger
-  private readonly redisSubscriber: Redis
-  private readonly redisPublisher: Redis
+  // private readonly redisSubscriber: Redis
+  // private readonly redisPublisher: Redis
+  private natsConnection: NatsConnection;
   private server: Server;
+  private sc = StringCodec();
+  private subscriptions: Map<string, Subscription> = new Map();
+  private jetStreamManager: JetStreamManager;
+  private jetStreamClient: JetStreamClient;
+
   constructor(
     @InjectRepository(StoreQueuedMessage)
     private readonly storeQueuedMessageRepository: Repository<StoreQueuedMessage>,
     @InjectRedis() private readonly redis: Redis,
     private configService: ConfigService,
     private readonly httpService: HttpService,
+    //private readonly client: ClientNats,
+    @Inject('NATS_SERVICE') private readonly client: ClientProxy,
   ) {
     this.logger = new Logger(WebsocketService.name)
-    this.redisSubscriber = this.redis.duplicate()
-    this.redisPublisher = this.redis.duplicate()
-    this.initializeRedisMessageListener()
+    this.initializeNats()
+    // this.redisSubscriber = this.redis.duplicate()
+    // this.redisPublisher = this.redis.duplicate()
+    // this.initializeRedisMessageListener()
   }
 
   async onModuleInit() {
     try {
-      const pong = await this.redis.ping()
-      this.logger.log(`Connected to Redis successfully, ping response: ${pong}`)
+
+      await this.client.connect();
+      // const pong = await this.redis.ping()
+
+      this.logger.log(`Connected to Nats successfully`)
     } catch (error) {
-      this.logger.error('Failed to connect to Redis:', error.message)
+      this.logger.error('Failed to connect to Nats:', error.message)
+    }
+
+    try {
+      this.jetStreamManager = (await this.natsConnection.jetstreamManager());
+      const accountInfo = await this.jetStreamManager.getAccountInfo();
+      this.jetStreamClient = await this.natsConnection.jetstream();
+      console.log('JetStream is available:', accountInfo);
+    } catch (error) {
+      console.error('JetStream is unavailable:', error.message);
+    }
+
+  }
+
+
+  private async initializeNats() {
+    try {
+      const natsUrl = this.configService.get<string>('NATS_URL', 'nats://localhost:4222');
+      this.natsConnection = await connect({ servers: natsUrl });
+      this.logger.log('Connected to NATS server');
+      await this.initializeNATSMessageListener();
+    } catch (error) {
+      this.logger.error('Failed to connect to NATS:', error.message);
     }
   }
 
@@ -101,7 +138,7 @@ export class WebsocketService {
     try {
       // retrieve the list count of messages for the connection
       const redisMessageCount = await this.redis.llen(`connectionId:${connectionId}:queuemessages`)
-      
+
       const mongoMessageCount = await this.storeQueuedMessageRepository.count({
         where: { connectionId },
       })
@@ -173,7 +210,8 @@ export class WebsocketService {
 
       this.logger.debug(`[addMessage] Message stored in Redis for connectionId ${connectionId}`)
 
-      await this.redisPublisher.publish(connectionId, JSON.stringify(messagePublish))      
+      //await this.redisPublisher.publish(connectionId, JSON.stringify(messagePublish))
+      await this.natsConnection.publish(connectionId, JSON.stringify(messagePublish))
 
       if (!(await this.getLiveSession(dto))) {
         // If not in a live session
@@ -372,27 +410,36 @@ export class WebsocketService {
         this.logger.log('[addLiveSession] LiveSession added successfully', { connectionId })
 
         // Use the general Redis connection (not the subscriber) to check subscribed channels
-        const subscribedChannels = await this.redis.pubsub('CHANNELS')
-        const isSubscribed = subscribedChannels.includes(connectionId)
+        // const subscribedChannels = await this.redis.pubsub('CHANNELS')
+        // const isSubscribed = subscribedChannels.includes(connectionId)
 
-        this.logger.debug(`[addLiveSession] subscribedChannels: ${subscribedChannels} - isSubscribed: ${isSubscribed}`)
+        const isSubscribed = this.isSubscribed(connectionId);
+        this.logger.debug(`[addLiveSession] isSubscribed: ${isSubscribed}`);
 
         if (isSubscribed) {
-          // If already subscribed, unsubscribe first using the subscriber Redis connection
-          this.logger.log(`[addLiveSession] Already subscribed to ${connectionId}, unsubscribing first...`)          
-          await this.redisSubscriber.unsubscribe(connectionId, (err, count) => {
-            if (err) this.logger.error(err.message)
-            this.logger.log(`Unsubscribed ${count} from ${connectionId} channel.`)
-          })
+          // Unsubscribe if already subscribed
+          this.logger.log(
+            `[addLiveSession] Already subscribed to ${connectionId}, unsubscribing first...`,
+          );
+          await this.unsubscribeFromTopic(connectionId);
+          this.logger.log(
+            `Unsubscribed from topic ${connectionId} successfully.`,
+          );
         }
 
-        this.logger.debug('[addLiveSession] try subscribe')
+        this.logger.debug(`[addLiveSession] subscribedChannels: ${this.subscriptions} - isSubscribed: ${isSubscribed}`)
 
-        // Use redisSubscriber for subscriptions only
-        await this.redisSubscriber.subscribe(connectionId, (err, count) => {
-          if (err) this.logger.error(err.message)
-          this.logger.log(`Subscribed ${count} to ${connectionId} channel.`)
-        })
+        this.logger.debug('[addLiveSession] Attempting to subscribe to topic');
+
+        // Subscribe to the topic
+        await this.subscribeToTopic(connectionId, (message) => {
+          this.logger.log(
+            `[addLiveSession] Received message on ${connectionId}:`,
+            message,
+          );
+          // Handle the incoming message here
+        });
+        this.logger.log(`Subscribed to topic ${connectionId} successfully.`);
 
         return true
       } else {
@@ -431,8 +478,10 @@ export class WebsocketService {
       if (deleteResult > 0) {
         this.logger.debug('[removeLiveSession] LiveSession removed successfully from Redis', { connectionId })
 
-        // Unsubscribe from the Redis channel for the connection ID
-        await this.redisSubscriber.unsubscribe(connectionId)
+        // // Unsubscribe from the Redis channel for the connection ID
+        // await this.redisSubscriber.unsubscribe(connectionId)
+
+        await this.unsubscribeFromTopic(connectionId);
 
         this.logger.debug('[removeLiveSession] Unsubscribed from Redis channel', { connectionId })
         return true
@@ -531,7 +580,7 @@ export class WebsocketService {
       const messagesToSend = await this.storeQueuedMessageRepository.find({
         where: {
           state: MessageState.sending,
-         connectionId,
+          connectionId,
         },
       });
 
@@ -544,7 +593,7 @@ export class WebsocketService {
         //   { $set: { state: MessageState.pending } },
         // )
 
-        const messagesToUpdate = await this.storeQueuedMessageRepository.findBy({          
+        const messagesToUpdate = await this.storeQueuedMessageRepository.findBy({
           id: In(messageIds), // `In` operator replaces `$in`
         });
 
@@ -560,7 +609,7 @@ export class WebsocketService {
           updatedCount: messagesToUpdate.length,
         })
 
-        return messagesToUpdate.length 
+        return messagesToUpdate.length
       } else {
         // Logs that no messages were found in the "sending" state
         this.logger.debug('[checkPendingMessagesInQueue] No messages in "sending" state')
@@ -631,28 +680,67 @@ export class WebsocketService {
     }
   }
 
+  // /**
+  //  * Initializes the Redis message listener to handle incoming messages from subscribed channels.
+  //  * This listener will log and delegate message handling to the `handleMessage` method.
+  //  */
+  // private initializeRedisMessageListener(): void {
+  //   this.logger.log('[initializeRedisMessageListener] Initializing Redis message listener')
+
+  //   try {
+  //     // Register the message listener for Redis channels
+  //     this.redisSubscriber.on('message', (channel: string, message: string) => {
+  //       this.logger.log(`*** [initializeRedisMessageListener] Received message from ${channel}: ${message} **`)
+
+  //       // Delegate message processing to the handleMessage method
+  //       this.handleMessage(channel, message)
+  //     })
+
+  //     this.logger.log('[initializeRedisMessageListener] Listener successfully registered')
+  //   } catch (error) {
+  //     // Log any errors that occur during listener initialization
+  //     this.logger.error('[initializeRedisMessageListener] Error initializing message listener', {
+  //       error: error.message,
+  //     })
+  //   }
+  // }
+
   /**
    * Initializes the Redis message listener to handle incoming messages from subscribed channels.
    * This listener will log and delegate message handling to the `handleMessage` method.
    */
-  private initializeRedisMessageListener(): void {
-    this.logger.log('[initializeRedisMessageListener] Initializing Redis message listener')
+  private async initializeNATSMessageListener(): Promise<void> {
+    this.logger.log('[initializeNATSMessageListener] Initializing NATS message listener');
 
     try {
-      // Register the message listener for Redis channels
-      this.redisSubscriber.on('message', (channel: string, message: string) => {
-        this.logger.log(`*** [initializeRedisMessageListener] Received message from ${channel}: ${message} **`)
+      const codec = JSONCodec();
 
-        // Delegate message processing to the handleMessage method
-        this.handleMessage(channel, message)
-      })
+      // Subscribe to the desired subject(s) (wildcard subjects are allowed)
+      const subject = 'channel.*'; // Replace with your specific subject or use wildcard for multiple
+      const subscription = this.natsConnection.subscribe(subject);
 
-      this.logger.log('[initializeRedisMessageListener] Listener successfully registered')
+      this.logger.log('[initializeNATSMessageListener] Listener successfully registered');
+
+      // Handle messages as they arrive
+      (async () => {
+        for await (const msg of subscription) {
+          const channel = msg.subject; // In NATS, the subject is equivalent to the Redis channel
+          const message = codec.decode(msg.data) as string;
+
+          this.logger.log(`*** [initializeNATSMessageListener] Received message from ${channel}: ${message} **`);
+
+          // Delegate message processing to the handleMessage method
+          this.handleMessage(channel, message);
+        }
+      })().catch((error) => {
+        this.logger.error('[initializeNATSMessageListener] Error in message listener loop', {
+          error: error.message,
+        });
+      });
     } catch (error) {
-      // Log any errors that occur during listener initialization
-      this.logger.error('[initializeRedisMessageListener] Error initializing message listener', {
+      this.logger.error('[initializeNATSMessageListener] Error initializing message listener', {
         error: error.message,
-      })
+      });
     }
   }
 
@@ -731,34 +819,34 @@ export class WebsocketService {
       //   .lean()
       //   .exec()
 
-        // const messages = await this.storeQueuedMessageRepository.find({
-        //   where: [
-        //     { connectionId, state: 'pending' },
-        //     { recipientKeys: Like(`%${recipientDid}%`), state: 'pending' },
-        //   ],
-        //   order: { createdAt: 'ASC' },
-        //   take: limit,
-        //   select: ['id', 'createdAt', 'encryptedMessage'],
-        // });
-        
-        const messages = await this.storeQueuedMessageRepository.find({
-          where: [
-            { connectionId, state: 'pending' },
-            {
-              state: 'pending',
-              recipientKeys: Raw((alias) => `${alias} LIKE :recipientDid`, { recipientDid: `%${recipientDid}%` }),
-            },
-          ],
-          order: { createdAt: 'ASC' },
-          take: limit,
-          select: ['id', 'createdAt', 'encryptedMessage'],
-        });
+      // const messages = await this.storeQueuedMessageRepository.find({
+      //   where: [
+      //     { connectionId, state: 'pending' },
+      //     { recipientKeys: Like(`%${recipientDid}%`), state: 'pending' },
+      //   ],
+      //   order: { createdAt: 'ASC' },
+      //   take: limit,
+      //   select: ['id', 'createdAt', 'encryptedMessage'],
+      // });
 
-        const mongoMappedMessages: QueuedMessage[] = messages.map((msg) => ({
-          id: msg.id.toString(),
-          receivedAt: msg.createdAt,
-          encryptedMessage: JSON.parse(msg.encryptedMessage),
-        }));
+      const messages = await this.storeQueuedMessageRepository.find({
+        where: [
+          { connectionId, state: 'pending' },
+          {
+            state: 'pending',
+            recipientKeys: Raw((alias) => `${alias} LIKE :recipientDid`, { recipientDid: `%${recipientDid}%` }),
+          },
+        ],
+        order: { createdAt: 'ASC' },
+        take: limit,
+        select: ['id', 'createdAt', 'encryptedMessage'],
+      });
+
+      const mongoMappedMessages: QueuedMessage[] = messages.map((msg) => ({
+        id: msg.id.toString(),
+        receivedAt: msg.createdAt,
+        encryptedMessage: JSON.parse(msg.encryptedMessage),
+      }));
 
       // const mongoMappedMessages: QueuedMessage[] = mongoMessages.map((msg) => ({
       //   id: msg.messageId,
@@ -828,18 +916,18 @@ export class WebsocketService {
       //   .lean()
       //   .exec()
 
-        const sqliteMessages = await this.storeQueuedMessageRepository.find({
-          where: [
-            { connectionId, state: 'pending' },
-            {
-              state: 'pending',
-              recipientKeys: Raw((alias) => `${alias} LIKE :recipientDid`, { recipientDid: `%${recipientDid}%` }),
-            },
-          ],
-          order: { createdAt: 'ASC' },
-          take: 100, // Adjust limit as needed
-          select: ['id', 'createdAt', 'encryptedMessage', 'encryptedMessageByteCount'],
-        });
+      const sqliteMessages = await this.storeQueuedMessageRepository.find({
+        where: [
+          { connectionId, state: 'pending' },
+          {
+            state: 'pending',
+            recipientKeys: Raw((alias) => `${alias} LIKE :recipientDid`, { recipientDid: `%${recipientDid}%` }),
+          },
+        ],
+        order: { createdAt: 'ASC' },
+        take: 100, // Adjust limit as needed
+        select: ['id', 'createdAt', 'encryptedMessage', 'encryptedMessageByteCount'],
+      });
 
       for (const msg of sqliteMessages) {
         const messageSize =
@@ -897,4 +985,125 @@ export class WebsocketService {
       return []
     }
   }
+
+  async subscribeToTopic(topic: string, handler: (message: any) => void): Promise<void> {
+    const subscription = this.natsConnection.subscribe(topic);
+    this.subscriptions.set(topic, subscription);
+
+    // Consume messages
+    (async () => {
+      for await (const message of subscription) {
+        const decodedMessage = message.data.toString();
+        handler(decodedMessage);
+      }
+    })().catch((err) => console.error(`Error processing messages for ${topic}:`, err));
+
+    console.log(`Subscribed to topic: ${topic}`);
+  }
+
+  async unsubscribeFromTopic(topic: string): Promise<void> {
+    const subscription = this.subscriptions.get(topic);
+
+    if (subscription) {
+      subscription.unsubscribe();
+      this.subscriptions.delete(topic);
+      console.log(`Unsubscribed from topic: ${topic}`);
+    } else {
+      console.warn(`No subscription found for topic: ${topic}`);
+    }
+  }
+
+  isSubscribed(topic: string): boolean {
+    return this.subscriptions.has(topic);
+  }
+
+  // Create a stream for the list
+  async createList(connectionId: string) {
+    const key = `connectionId:${connectionId}:queuemessages`;
+    await this.jetStreamManager.streams.add({ name: key, subjects: ['connectionId.*'] });
+  }
+
+
+  // Add to list
+  async pushToList(connectionId: string, messageData: any) {
+    const key = `connectionId:${connectionId}:queuemessages`;
+    const js = this.natsConnection.jetstream();
+    await js.publish(key, JSON.stringify(messageData));
+
+  }
+
+  // Get list length
+  async GetListLength(connectionId: string) {
+    const key = `connectionId:${connectionId}:queuemessages`;
+    const info = await this.jetStreamManager.streams.info(key);
+    console.log('List Length:', info.state.messages);
+    return info.state.messages;
+  }
+
+
+  // Get range
+  async GetRange(connectionId: string, range: number): Promise<string[]> {
+    const key = `connectionId:${connectionId}:queuemessages`;
+    const js = this.natsConnection.jetstream();
+
+    const consumer = await js.consumers.get(key);
+    const messages = (await consumer.fetch({ max_messages: range }))
+    const messageList: string[] = [];
+
+    for await (const msg of messages) {
+      messageList.push(this.sc.decode(msg.data)); // Decode message data to string
+     // msg.ack(); // Acknowledge the message
+    }
+    return messageList;
+  }
+
+
+    // hmset()
+    async setKeyValue(sessionKey: string,value: any ) {
+      const js = this.natsConnection.jetstream();
+      const kv = await js.views.kv(sessionKey);
+      await kv.put(sessionKey, JSON.stringify(value));
+      return 'OK';
+    }
+
+
+
+    // hmget()
+    async getKeyValue(sessionKey: string,value: any ) {
+      const js = this.natsConnection.jetstream();
+      const kv = await js.views.kv(sessionKey);
+      const entry = (await kv.get(sessionKey)).value;
+      return JSON.parse(this.sc.decode(entry));
+    }
+
+    // delete key()
+    async removeKeyValue(sessionKey: string,value: any ): Promise<number> {
+      const js = this.natsConnection.jetstream();
+      const kv = await js.views.kv(sessionKey);
+      (await kv.delete(sessionKey));
+      return 1;
+    }
+  
+  
+
+
+  /*async createKeyValueStore(bucketName: string) {
+    const js = this.natsConnection.jetstream();
+    const kv = await js.views.kv('my-hash');
+    await jsm.jetstream.create({ bucket: bucketName });
+  }
+
+  async putKey(bucketName: string, key: string, value: string) {
+    const js = this.natsService.getJetStream();
+    const kv = await js.kv(bucketName);
+    await kv.put(key, Buffer.from(value));
+  }
+
+  async getKey(bucketName: string, key: string) {
+    const js = this.natsService.getJetStream();
+    const kv = await js.kv(bucketName);
+    const entry = await kv.get(key);
+    return entry ? entry.value.toString() : null;
+  }*/
+
 }

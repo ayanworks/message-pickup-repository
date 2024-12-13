@@ -8,6 +8,7 @@ import { StoreLiveSessionSchema, StoreLiveSession } from './schemas/StoreLiveSes
 import { MessagePersister } from './services/MessagePersister'
 import { HttpModule } from '@nestjs/axios'
 import { TypeOrmModule } from '@nestjs/typeorm'
+import { ClientsModule, Transport } from '@nestjs/microservices'
 
 @Module({
   imports: [
@@ -17,6 +18,15 @@ import { TypeOrmModule } from '@nestjs/typeorm'
     // ]),
     TypeOrmModule.forFeature([StoreQueuedMessage]),
     HttpModule,
+    ClientsModule.register([
+      {
+        name: 'NATS_SERVICE', // Unique token
+        transport: Transport.NATS,
+        options: {
+          servers: ['nats://localhost:4222'], // Replace with your NATS server URL
+        },
+      },
+    ]),
   ],
   providers: [WebsocketGateway, WebsocketService, MessagePersister, StoreQueuedMessage],
 })
